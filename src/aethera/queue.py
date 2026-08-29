@@ -38,10 +38,24 @@ class Queue:
         self.socket_path = socket_path
         self.name = name if name.startswith("subject:") else f"subject:queues/{name}"
 
-    def host(self, *, delivery: str = "exclusive", accepts: list[str] | None = None) -> Queue:
-        json_request(self.socket_path, "POST", "/v0/subjects", {
+    def host(self, *, delivery: str = "exclusive", accepts: list[str] | None = None,
+             idle_s: int = 0, max_events: int = 0) -> Queue:
+        """Declare this queue on the local node.
+
+        idle_s self-destructs the queue after that much inactivity and
+        max_events caps total publishes; zero leaves each unlimited, except
+        temporary ``_reply/`` queues, which get tight server-side defaults
+        either way. A publish to an expired reply queue raises with
+        "expired" — the caller is gone; do not retry.
+        """
+        body: dict[str, object] = {
             "name": self.name, "delivery": delivery, "accepts": accepts or [],
-        })
+        }
+        if idle_s:
+            body["idle_s"] = idle_s
+        if max_events:
+            body["max_events"] = max_events
+        json_request(self.socket_path, "POST", "/v0/subjects", body)
         return self
 
     def publish(self, event: Event) -> tuple[str, bool]:
