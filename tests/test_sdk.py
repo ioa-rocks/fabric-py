@@ -81,3 +81,14 @@ def test_default_sockets_follow_the_daemon_state_move(tmp_path, monkeypatch) -> 
 
     # An explicit state directory is never redirected.
     assert Fabric(queue_state="/q").queue_socket.as_posix() == "/q/control.sock"
+
+
+def test_queue_host_spread_is_sent_only_when_asked() -> None:
+    queue = Fabric(queue_state="/q").queue("crawl")
+    with patch("aethera.queue.json_request", return_value={}) as call:
+        queue.host(delivery="shared")
+        assert "spread" not in call.call_args.args[3]
+        queue.host(delivery="shared", spread=True)
+        assert call.call_args.args[3]["spread"] is True
+        queue.host(delivery="shared", spread=False)
+        assert call.call_args.args[3]["spread"] is False

@@ -22,6 +22,11 @@ resolves placement and carries operations across the mesh. `Bucket` currently
 supports `objects`, `put`, and `get`; `Queue` supports `host`, `publish`,
 `claim`, `ack`, and `wait`.
 
+`queue.host(delivery="shared", spread=True)` on two or more nodes makes
+them all hosts of that queue, so it keeps working when one is down.
+Publishers and workers need no change: the local daemon picks a host,
+falls over to the next, and claims from all of them.
+
 By default the sockets are `~/.local/share/astral/control.sock` and
 `~/.local/share/vault/control.sock` (`$XDG_DATA_HOME` when set). An install
 the daemon has not moved yet is found under `~/.config`. The path is chosen

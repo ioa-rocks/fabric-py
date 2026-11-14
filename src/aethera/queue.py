@@ -39,8 +39,14 @@ class Queue:
         self.name = name if name.startswith("subject:") else f"subject:queues/{name}"
 
     def host(self, *, delivery: str = "exclusive", accepts: list[str] | None = None,
-             idle_s: int = 0, max_events: int = 0) -> Queue:
+             idle_s: int = 0, max_events: int = 0, spread: bool | None = None) -> Queue:
         """Declare this queue on the local node.
+
+        spread=True lets other nodes host the same shared queue too:
+        publishers pick one host and fall over to the next, consumers
+        claim from all. Call it on every node that should host the queue.
+        It stays on across later host() calls that leave spread unset;
+        spread=False turns it off on this node.
 
         idle_s self-destructs the queue after that much inactivity and
         max_events caps total publishes; zero leaves each unlimited, except
@@ -55,6 +61,8 @@ class Queue:
             body["idle_s"] = idle_s
         if max_events:
             body["max_events"] = max_events
+        if spread is not None:
+            body["spread"] = spread
         json_request(self.socket_path, "POST", "/v0/subjects", body)
         return self
 
