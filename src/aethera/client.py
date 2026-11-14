@@ -16,6 +16,26 @@ class Resource:
     host: str = ""
 
 
+def _xdg_home(variable: str, *fallback: str) -> Path:
+    value = os.environ.get(variable, "")
+    return Path(value) if os.path.isabs(value) else Path.home().joinpath(*fallback)
+
+
+def default_state(name: str) -> Path:
+    """Fabric's default state directory for a subsystem ("astral", "vault").
+
+    State lives under the data home. Before the daemon has moved an older
+    install, it is still under the config home, so use that while the new
+    directory does not exist. Mirrors Fabric's own client discovery.
+    """
+    current = _xdg_home("XDG_DATA_HOME", ".local", "share") / name
+    if not current.exists():
+        legacy = _xdg_home("XDG_CONFIG_HOME", ".config") / name
+        if legacy.is_dir():
+            return legacy
+    return current
+
+
 class Fabric:
     """Entry point for resources available through the local Fabric daemon."""
 
@@ -24,9 +44,8 @@ class Fabric:
                  bucket_state: str | os.PathLike[str] | None = None) -> None:
         if key is not None:
             raise NotImplementedError("client-key authentication is designed but not implemented")
-        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-        self.queue_socket = Path(queue_state or base / "astral") / "control.sock"
-        self.bucket_socket = Path(bucket_state or base / "vault") / "control.sock"
+        self.queue_socket = Path(queue_state or default_state("astral")) / "control.sock"
+        self.bucket_socket = Path(bucket_state or default_state("vault")) / "control.sock"
 
     def queue(self, name: str) -> Queue:
         return Queue(self.queue_socket, name)

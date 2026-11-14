@@ -22,6 +22,12 @@ resolves placement and carries operations across the mesh. `Bucket` currently
 supports `objects`, `put`, and `get`; `Queue` supports `host`, `publish`,
 `claim`, `ack`, and `wait`.
 
+By default the sockets are `~/.local/share/astral/control.sock` and
+`~/.local/share/vault/control.sock` (`$XDG_DATA_HOME` when set). An install
+the daemon has not moved yet is found under `~/.config`. The path is chosen
+when `Fabric()` is created, so restart long-running workers after the
+daemon moves its state. `queue_state=` and `bucket_state=` override it.
+
 Client-key authentication is designed but not implemented. Passing `key=`
 fails loudly rather than pretending the current Unix-user boundary isolates
 agents.

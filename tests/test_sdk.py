@@ -51,3 +51,33 @@ def test_fortune_caller_round_trip() -> None:
         assert call(Fabric(queue_state="/q"), timeout=5) == "you will ship"
     request = seen["subject:queues/fortune"]["event"]
     assert request["reply_target"].startswith("subject:queues/_reply/")
+
+
+def test_default_sockets_follow_the_daemon_state_move(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    data, config = tmp_path / ".local" / "share", tmp_path / ".config"
+
+    # A fresh machine: the data home, for both subsystems.
+    fabric = Fabric()
+    assert fabric.queue_socket == data / "astral" / "control.sock"
+    assert fabric.bucket_socket == data / "vault" / "control.sock"
+
+    # Not migrated yet: only the old directory exists.
+    (config / "astral").mkdir(parents=True)
+    assert Fabric().queue_socket == config / "astral" / "control.sock"
+    assert Fabric().bucket_socket == data / "vault" / "control.sock"
+
+    # Migrated: the new directory wins even if an old one is still around.
+    (data / "astral").mkdir(parents=True)
+    assert Fabric().queue_socket == data / "astral" / "control.sock"
+
+    # XDG_DATA_HOME is honoured when absolute, ignored when relative.
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    assert Fabric().bucket_socket == tmp_path / "xdg" / "vault" / "control.sock"
+    monkeypatch.setenv("XDG_DATA_HOME", "relative")
+    assert Fabric().bucket_socket == data / "vault" / "control.sock"
+
+    # An explicit state directory is never redirected.
+    assert Fabric(queue_state="/q").queue_socket.as_posix() == "/q/control.sock"
