@@ -2,8 +2,8 @@
 
 from .bucket import Bucket
 from .client import Fabric, Resource
-from .queue import Claim, Event, Queue
+from .queue import Call, Claim, Event, Queue
 from .transport import FabricError
 
-__all__ = ["Bucket", "Claim", "Event", "Fabric", "FabricError", "Queue", "Resource"]
+__all__ = ["Bucket", "Call", "Claim", "Event", "Fabric", "FabricError", "Queue", "Resource"]
 

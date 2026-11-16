@@ -31,28 +31,23 @@ def serve(queue: Queue, *, consumer: str, executable: str) -> None:
         for claim in claims:
             request = claim.event
             try:
-                if not request.reply_target:
-                    raise RuntimeError("request has no reply_target")
                 content, kind = run_fortune(executable), "result"
             except Exception as error:
                 content, kind = str(error), "error"
             try:
-                Queue(queue.socket_path, request.reply_target).publish(Event(
-                    id=f"{request.id}:fortune-result",
-                    kind=kind,
-                    source=consumer,
-                    content=content,
-                    correlation_id=request.correlation_id or request.id,
-                ))
-                queue.ack(request.id, consumer=consumer)
+                # One step records the reply and acknowledges the request.
+                if not queue.complete(request.id, Event(kind=kind, source="fortune", content=content)):
+                    print(f"{request.id}: nobody is waiting for the reply", file=sys.stderr)
             except FabricError as error:
-                print(f"delivery failed; request remains leased for retry: {error}", file=sys.stderr)
+                # Not acknowledged: the lease lapses and the request is claimed again.
+                print(f"{request.id}: not completed, it will be claimed again: {error}", file=sys.stderr)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state", help="Astral state directory")
-    parser.add_argument("--consumer", default=f"fortune@{socket.gethostname()}")
+    # No "@": the daemon appends the principal to the consumer name itself.
+    parser.add_argument("--consumer", default=f"fortune-{socket.gethostname()}")
     parser.add_argument("--fortune", default="fortune", help="fortune executable")
     args = parser.parse_args()
     try:

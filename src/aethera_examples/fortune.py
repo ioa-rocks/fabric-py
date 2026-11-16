@@ -3,41 +3,21 @@
 from __future__ import annotations
 
 import argparse
-import os
-import socket
 import sys
-import uuid
 
 from aethera import Event, Fabric, FabricError
 
+
 def call(fabric: Fabric, *, timeout: int) -> str:
-    request_id = uuid.uuid4().hex
-    entity = f"fortune-caller-{socket.gethostname()}-{os.getpid()}-{request_id[:8]}"
-    replies = fabric.queue(f"_reply/{entity}").host(delivery="exclusive", accepts=["result", "error"])
-    requests = fabric.queue("fortune")
-    requests.publish(Event(
-        id=request_id,
-        kind="request",
-        source="astral-fortune",
-        content="fortune -s",
-        reply_target=replies.name,
-        correlation_id=request_id,
-    ))
-    remaining = timeout
-    while remaining > 0:
-        claims = replies.claim(consumer=entity, lease=30)
-        if claims:
-            response = claims[0].event
-            replies.ack(response.id, consumer=entity)
-            if response.correlation_id != request_id:
-                continue
-            if response.kind == "error":
-                raise RuntimeError(response.content)
-            return response.content
-        wait_for = min(remaining, 10)
-        replies.wait(timeout=wait_for)
-        remaining -= wait_for
-    raise TimeoutError(f"no fortune worker replied within {timeout}s")
+    # One call: the host of the queue keeps the reply with the request, so
+    # there is nothing to declare and nothing to clean up.
+    reply = fabric.queue("fortune").call(
+        Event(kind="request", source="astral-fortune", content="fortune -s"),
+        timeout=timeout,
+    )
+    if reply.kind == "error":
+        raise RuntimeError(reply.content)
+    return reply.content
 
 
 def main() -> None:

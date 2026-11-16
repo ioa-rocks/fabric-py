@@ -28,29 +28,95 @@ def test_event_parser_ignores_future_envelope_fields() -> None:
     assert event.content == "ok"
 
 
+class FakeDaemon:
+    """The control socket as the SDK sees it, for request/reply."""
+
+    def __init__(self, *, replies_after: int = 0, reply: dict | None = None) -> None:
+        self.calls: list[tuple[str, dict]] = []
+        self.polls = 0
+        self.replies_after = replies_after
+        self.reply = reply or {"id": "e1:reply", "kind": "result", "source": "fortune@nas",
+                               "content": "you will ship", "correlation_id": "e1",
+                               "signer": "did:key:z6MkWorker", "signature": "c2ln"}
+
+    def __call__(self, socket_path, method, path, body=None, timeout=None):
+        self.calls.append((path, body))
+        if path == "/v0/append":
+            return {"id": "e1", "fresh": True}
+        if path == "/v0/outcome":
+            self.polls += 1
+            return {"outcome": self.reply} if self.polls > self.replies_after else {}
+        if path == "/v0/complete":
+            return {"delivered": True}
+        if path == "/v0/claim":
+            return [{"event": {"id": "e1", "kind": "request", "source": "caller@desk"},
+                     "consumer": body["consumer"], "lease_until": 1, "awaited": True},
+                    {"event": {"id": "e2", "kind": "request", "source": "cron@desk"},
+                     "consumer": body["consumer"], "lease_until": 1}]
+        return {"ok": True}
+
+    def paths(self) -> list[str]:
+        return [path for path, _ in self.calls]
+
+
 def test_fortune_caller_round_trip() -> None:
     from aethera_examples.fortune import call
 
-    seen: dict[str, dict] = {}
-
-    def daemon(socket_path, method, path, body=None, timeout=None):
-        if path == "/v0/append":
-            seen[body["name"]] = body
-            return {"id": body["event"].get("id", "e1"), "fresh": True}
-        if path == "/v0/claim":
-            request = seen.get("subject:queues/fortune")
-            if request is None:
-                return []
-            return [{"event": {"id": "r1", "kind": "result", "source": "worker",
-                               "content": "you will ship",
-                               "correlation_id": request["event"]["correlation_id"]},
-                     "consumer": body["consumer"], "lease_until": 1}]
-        return None
-
+    daemon = FakeDaemon()
     with patch("aethera.queue.json_request", side_effect=daemon):
         assert call(Fabric(queue_state="/q"), timeout=5) == "you will ship"
-    request = seen["subject:queues/fortune"]["event"]
-    assert request["reply_target"].startswith("subject:queues/_reply/")
+    # One request, nothing declared, the reply read and then released.
+    assert daemon.paths() == ["/v0/append", "/v0/outcome", "/v0/release"]
+    append = daemon.calls[0][1]
+    assert append["name"] == "subject:queues/fortune" and append["reply"] is True
+    assert "reply_target" not in append["event"]
+    assert daemon.calls[1][1] == {"name": "subject:queues/fortune", "event_id": "e1", "timeout_s": 5}
+
+
+def test_call_times_out_and_releases() -> None:
+    daemon = FakeDaemon(replies_after=99)
+    queue = Fabric(queue_state="/q").queue("fortune")
+    with patch("aethera.queue.json_request", side_effect=daemon):
+        with pytest.raises(TimeoutError):
+            queue.call(Event(kind="request", source="test"), timeout=1)
+    # Giving up frees the caller's place in the quota of requests in flight.
+    assert daemon.paths()[-1] == "/v0/release"
+
+
+def test_call_handle_survives_a_restart() -> None:
+    daemon = FakeDaemon()
+    queue = Fabric(queue_state="/q").queue("fortune")
+    with patch("aethera.queue.json_request", side_effect=daemon):
+        request_id = queue.request(Event(kind="request", source="test")).id
+        # A new process knows only the queue and the id it stored.
+        reply = queue.call_handle(request_id).result(timeout=0)
+    assert reply is not None and reply.content == "you will ship"
+    assert reply.signer == "did:key:z6MkWorker"
+    # Reading is not consuming: nothing was released.
+    assert "/v0/release" not in daemon.paths()
+
+
+def test_long_wait_is_split_into_daemon_sized_parks() -> None:
+    daemon = FakeDaemon(replies_after=2)
+    queue = Fabric(queue_state="/q").queue("fortune")
+    with patch("aethera.queue.json_request", side_effect=daemon):
+        reply = queue.call_handle("e1").result(timeout=1500)
+    assert reply is not None
+    assert [body["timeout_s"] for _, body in daemon.calls] == [600, 600, 300]
+
+
+def test_worker_completes_in_one_step() -> None:
+    daemon = FakeDaemon()
+    queue = Fabric(queue_state="/q").queue("fortune")
+    with patch("aethera.queue.json_request", side_effect=daemon):
+        awaited, plain = queue.claim(consumer="worker", limit=2)
+        assert awaited.awaited and not plain.awaited
+        assert queue.complete(awaited.event.id, Event(kind="result", source="fortune", content="ok"))
+    path, body = daemon.calls[-1]
+    assert path == "/v0/complete" and body["event_id"] == "e1"
+    assert body["event"] == {"kind": "result", "source": "fortune", "content": "ok"}
+    # No separate ack and no publish to a reply queue.
+    assert daemon.paths() == ["/v0/claim", "/v0/complete"]
 
 
 def test_default_sockets_follow_the_daemon_state_move(tmp_path, monkeypatch) -> None:
