@@ -1,148 +1,177 @@
-# fabric-py
+# Fabric Python SDK
 
-Python SDK for resources exposed by the local Fabric daemon. Operator clients
-are dependency-free; scoped credentials use the optional `auth` extra.
-The distribution is `aethera-sdk` and the import is `aethera` to avoid
-colliding with Python's established `fabric` deployment package.
+**Use Fabric's durable queues and object storage from Python.** The SDK talks
+to a local [Fabric node](https://github.com/ioa-rocks/fabric); the node handles
+peer connectivity, resource placement, circle authority and remote delivery.
+
+The distribution is `aethera-sdk` and the import is `aethera` (IOA was formerly
+called Aethera). This avoids a collision with Python's unrelated `fabric` package.
+
+**Pre-alpha.** The API and daemon protocol can change together. Install from
+source and use matching current checkouts of this SDK and Fabric. There is no
+stable PyPI release yet. Python 3.11 or newer is required.
+
+## Install
+
+```sh
+git clone https://github.com/ioa-rocks/fabric-py.git
+cd fabric-py
+python3 -m pip install -e '.[auth]'
+```
+
+The `auth` extra supplies `cryptography` for Ed25519 signatures and `cbor2` for
+reading issued credentials. For local operator use without scoped credentials,
+`python3 -m pip install -e .` installs the dependency-free resource client.
+
+Build the node from [Fabric's repository](https://github.com/ioa-rocks/fabric).
+Then try the [two-node scoped-worker demo](examples/README.md):
+
+```sh
+python3 examples/scoped_worker.py --fabric ../fabric/fabric
+```
+
+It creates disposable identities and state, starts two loopback nodes, delivers
+a job, verifies a signed reply, and demonstrates denied and revoked access.
+It needs no root privileges, model API, external account, or live node setup.
+
+## Request work
+
+With a connected Fabric node and a declared `jobs` queue:
 
 ```python
 from aethera import Event, Fabric
 
-fabric = Fabric()
-
-photos = fabric.bucket("photos")
-photos.put("hello.txt", b"hello")
-print(photos.get("hello.txt"))
-
-fortune = fabric.queue("fortune")
-fortune.publish(Event(kind="request", source="example"))
-```
-
-Resource handles are lazy. The SDK talks only to local Unix sockets; Fabric
-resolves placement and carries operations across the mesh. `Bucket` currently
-supports `objects`, `put`, and `get`; `Queue` supports `host`, `publish`,
-`claim`, `ack`, `wait`, and request/reply through `request`, `call` and
-`complete`.
-
-## Request and reply
-
-The reply to a request is kept with the request, by the node that hosts the
-queue. Nothing is declared for it.
-
-```python
-# caller
-reply = fabric.queue("fortune").call(Event(kind="request", source="me"), timeout=30)
+reply = Fabric().queue("jobs").call(
+    Event(kind="request", source="caller", content="hello"), timeout=30
+)
 print(reply.content, "answered by", reply.signer)
-
-# worker
-queue = fabric.queue("fortune").host(delivery="shared")
-for claim in queue.claim(consumer="worker"):
-    queue.complete(claim.event.id, Event(kind="result", source="fortune", content="..."))
 ```
 
-`complete` records the reply and acknowledges the request in one step, and
-is how a worker finishes any request: it returns `False` when nobody is
-waiting for the reply. The daemon signs the reply with the device key. The
-caller's daemon checks that signature, and that the signer was entitled to
-answer, before `call` returns; the SDK itself does no cryptography.
+The operator declares the queue on one host:
 
-`call` is request, wait, release. To keep waiting across a restart, or to
-release only after your own commit, use the parts: `queue.request(event)`
-returns a handle whose `id` you can store; `queue.call_handle(id).result()`
-reads the reply as often as needed; `.release()` tells the host you are
-done. A caller may have 100 requests in flight per host; releasing frees a
-place at once. `call` raises `TimeoutError` when no reply arrives, and
-`FabricError` when the worker acknowledged the request without replying.
-
-For a long-lived conversation, host an ordinary queue for the answers and
-name it in the request's `reply_target`. Temporary `_reply/...` queues, the
-earlier pattern, are refused by the daemon.
-
-`queue.host(delivery="shared", spread=True)` on two or more nodes makes
-them all hosts of that queue, so it keeps working when one is down.
-Publishers and workers need no change: the local daemon picks a host,
-falls over to the next, and claims from all of them.
-
-By default the sockets are `~/.local/share/astral/control.sock` and
-`~/.local/share/vault/control.sock` (`$XDG_DATA_HOME` when set). An install
-the daemon has not moved yet is found under `~/.config`. The path is chosen
-when `Fabric()` is created, so restart long-running workers after the
-daemon moves its state. `queue_state=` and `bucket_state=` override it.
-
-## Scoped agent credentials
-
-Install signing support with the interpreter that runs your worker:
-
-```bash
-python3 -m pip install -e '.[auth]'
+```sh
+fabric astral subject -delivery shared subject:queues/jobs
 ```
 
-This adds `cryptography` (Ed25519) and `cbor2` (reading the issued statement).
-Ordinary clients do not import or require either package.
+`queue("jobs")` maps to `subject:queues/jobs`. Fully qualified `subject:...`
+names are accepted unchanged. Handles are lazy; constructing one does not
+contact the daemon.
 
-Mint a credential through the Fabric CLI, using the complete queue name:
+## Scope a worker's access
 
-```bash
+On the worker's node, issue a credential under its device admission:
+
+```sh
 fabric astral key new -res subject:queues/jobs -verbs claim -out worker.key
 ```
 
-The operator declares and places the queue separately. The worker selects the
-key file explicitly; its circle comes from the signed statement:
+The worker selects that file:
 
 ```python
-worker = Fabric(key="worker.key")
-jobs = worker.queue("jobs")
+jobs = Fabric(key="worker.key").queue("jobs")
 for claim in jobs.claim(consumer="worker"):
     jobs.complete(claim.event.id, Event(kind="result", source="worker", content="done"))
 ```
 
-`key=` is a path (including a `Path` object), not a self-asserted agent name.
-The SDK signs `publish`, `request`, `claim`, `ack`, `wait`, `complete`, and the
-call handle's `result` and `release`. A claim-only key can complete requests
-whose live leases it holds. For `ack`, pass the original consumer name you
-used in `claim`, rather than the server's stamped `claim.consumer`.
+`key=` accepts a string path or `Path`, not a self-asserted agent name. Its
+circle and principal come from the issued statement. The SDK signs exposed
+queue operations; the daemon verifies the chain, scope, expiry and revocation.
+The circle's owner key is not needed by the worker.
 
-Replies are signed by the worker's sub-key. The caller's daemon checks the
-signature and current authority before returning `Event.signer` and
-`Event.signature` (base64). Ordinary published events have a daemon-stamped
-`source`, not a verified `signer` field. A source label by itself is not an
-identity credential.
+| Operation | Behavior |
+| --- | --- |
+| `publish(event)` | Send an event; returns `(event_id, fresh)`. |
+| `request(event)` | Start an awaited request; returns a durable call handle. |
+| `call(event, timeout=...)` | Request, wait, and release the reply. |
+| `claim(consumer=..., lease=..., limit=...)` | Lease pending events. |
+| `complete(request_id, reply)` | Sign the reply and acknowledge its leased request in one host write. |
+| `ack(event_id, consumer=...)` | Acknowledge using the original consumer name passed to `claim`. |
+| `wait(timeout=...)` | Wait for pending mail or timeout. |
 
-Use an explicit `Event.id` when retrying a send from a durable outbox. If it
-is empty the SDK generates an ID for that invocation, without changing the
-input event. Save request IDs and use `call_handle(id).result()` followed by
-`release()` after your own durable commit to recover across restarts.
-Signed sends are refused when no host can be reached; the daemon never
-retries them under its broader device authority.
+A claim-only key can finish requests whose live leases it holds. It cannot
+publish new jobs or claim other resources. The SDK refuses queue hosting,
+resource listing and Vault access when a key is selected, because those SDK
+endpoints have no scoped-key binding. A missing or malformed credential never
+falls back to operator authority.
 
-A credentialed client refuses queue hosting, resource listing and Vault
-access: those endpoints have no scoped-key binding here. It never silently
-falls back to the operator. A separate `Fabric()` client deliberately acts
-as the local operator.
+Replies retain `Event.signer` and `Event.signature` (base64), checked by the
+caller's daemon before returning them. Ordinary published events have a
+daemon-stamped `source`; a source label by itself is not an identity credential.
 
-The daemon enforces scope, expiry and revocation; the SDK does not implement
-a second grant verifier. Socket access remains one Unix-user trust domain.
-The deployment must isolate a worker from operator sockets and other keys
-when it needs an adversarial boundary.
+## Recover across a restart
 
-Use the November 16 request/reply build or newer on both ends for scoped
-calls and signed `reply_target`. This is the local-daemon client; directly
-dialing a grantee key's `gates` without a daemon is not implemented.
+```python
+jobs = Fabric().queue("jobs")
+pending = jobs.request(Event(id="stable-job-id", kind="request", source="caller"))
+# Commit pending.id with your application's state before relying on it.
 
-## Validation
-
-```bash
-python3 -m pytest -q
-python3 tests/run_daemon_tests.py /path/to/fabric
+# A later process, under the same principal:
+pending = jobs.call_handle("stable-job-id")
+reply = pending.result(timeout=30)
+if reply is not None:
+    # Commit the reply to application state first.
+    pending.release()
 ```
 
-The second command overlays one test into the Fabric source checkout and
-runs two disposable nodes over loopback. It verifies the Python signatures
-against the Go daemon, both local and remote authorization, reply ownership,
-tampering, expiry and revocation. It needs Go, the Fabric source checkout
-and the `auth` extra; it leaves the source and live fleet unchanged.
+Reading a result does not consume it. Release after incorporating it. The
+convenience `call()` releases on success, timeout or interruption; it is not
+the durable-checkpoint interface. Releasing or timing out does not cancel the
+worker's work.
 
-The fortune example installs as `fabric-fortune-worker` and `fabric-fortune`.
+Delivery is **at least once**. Use stable `Event.id` values for retries and
+idempotent external effects. With a scoped credential and an empty event ID,
+the SDK generates one per invocation without changing the input event. Signed
+sends to unreachable hosts are refused, so an application outbox must retry
+them under the same identity. A long-lived conversation uses ordinary queues
+for progress and later results, optionally named by `reply_target`.
 
-License: MPL-2.0.
+## Storage and placement
 
+An operator client can use existing Vault buckets:
+
+```python
+photos = Fabric().bucket("photos")
+photos.put("hello.txt", b"hello")
+print(photos.get("hello.txt"))
+```
+
+The bucket must exist and have a writable placement for edits. The current
+bucket wrapper exposes `objects`, `put` and `get`; it is not the full Vault CLI.
+See [Vault's guide](https://github.com/ioa-rocks/fabric/blob/main/vault/README.md).
+
+An operator can host a shared queue on multiple nodes with
+`queue.host(delivery="shared", spread=True)`. These are independent host
+journals, not replicated queue storage. Events on an unavailable host wait
+there; loss of its disk loses them.
+
+## State and boundaries
+
+Default sockets are `~/.local/share/astral/control.sock` and
+`~/.local/share/vault/control.sock`, honoring an absolute `$XDG_DATA_HOME`.
+The legacy `~/.config` directories are used until the daemon migrates them.
+`queue_state=` and `bucket_state=` override the subsystem directories.
+
+The SDK is a local Unix-socket client, not a daemon-less peer. Keep explicit
+state paths short: the daemon's hashed fallback for very long socket paths is
+not implemented in Python yet. A scoped credential does not isolate a process
+that can also access operator sockets or other keys. The deployment supplies
+that process boundary. See [SECURITY.md](SECURITY.md).
+
+The included `fabric-fortune` and `fabric-fortune-worker` commands provide an
+older operator-level example; the worker additionally needs the `fortune`
+executable. The scoped-worker demo needs only this SDK and the Fabric binary.
+
+## Development
+
+```sh
+python3 -m pip install -e '.[auth]' pytest
+python3 -m pytest -q
+python3 tests/run_daemon_tests.py ../fabric
+```
+
+The last command needs the sibling Fabric source checkout and Go. It overlays
+a test into that checkout, starts two disposable nodes, and verifies signatures,
+permissions, reply ownership, tampering, expiry and revocation against the Go
+implementation. It leaves the source and live fleet unchanged.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Licensed under [MPL-2.0](LICENSE).

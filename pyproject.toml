@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "aethera-sdk"
 version = "0.2.0"
-description = "Python SDK for Fabric-hosted Aethera resources"
+description = "Python SDK for IOA Fabric queues and object storage"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MPL-2.0" }
@@ -13,6 +13,11 @@ dependencies = []
 
 [project.optional-dependencies]
 auth = ["cryptography>=41", "cbor2>=5.6"]
+
+[project.urls]
+Source = "https://github.com/ioa-rocks/fabric-py"
+Issues = "https://github.com/ioa-rocks/fabric-py/issues"
+Fabric = "https://github.com/ioa-rocks/fabric"
 
 [project.scripts]
 fabric-fortune = "aethera_examples.fortune:main"
