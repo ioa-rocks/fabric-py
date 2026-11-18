@@ -11,9 +11,9 @@ def test_resource_handles_are_lazy() -> None:
     assert fabric.bucket("photos").name == "photos"
 
 
-def test_client_key_is_not_silent() -> None:
-    with pytest.raises(NotImplementedError):
-        Fabric(key="concierge")
+def test_missing_client_key_never_falls_back_to_operator(tmp_path) -> None:
+    with pytest.raises(FileNotFoundError):
+        Fabric(key=tmp_path / "missing.key")
 
 
 def test_queue_publish() -> None:

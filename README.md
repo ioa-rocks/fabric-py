@@ -1,6 +1,7 @@
 # fabric-py
 
-Dependency-free Python SDK for resources exposed by the local Fabric daemon.
+Python SDK for resources exposed by the local Fabric daemon. Operator clients
+are dependency-free; scoped credentials use the optional `auth` extra.
 The distribution is `aethera-sdk` and the import is `aethera` to avoid
 colliding with Python's established `fabric` deployment package.
 
@@ -68,9 +69,78 @@ the daemon has not moved yet is found under `~/.config`. The path is chosen
 when `Fabric()` is created, so restart long-running workers after the
 daemon moves its state. `queue_state=` and `bucket_state=` override it.
 
-Client-key authentication is designed but not implemented. Passing `key=`
-fails loudly rather than pretending the current Unix-user boundary isolates
-agents.
+## Scoped agent credentials
+
+Install signing support with the interpreter that runs your worker:
+
+```bash
+python3 -m pip install -e '.[auth]'
+```
+
+This adds `cryptography` (Ed25519) and `cbor2` (reading the issued statement).
+Ordinary clients do not import or require either package.
+
+Mint a credential through the Fabric CLI, using the complete queue name:
+
+```bash
+fabric astral key new -res subject:queues/jobs -verbs claim -out worker.key
+```
+
+The operator declares and places the queue separately. The worker selects the
+key file explicitly; its circle comes from the signed statement:
+
+```python
+worker = Fabric(key="worker.key")
+jobs = worker.queue("jobs")
+for claim in jobs.claim(consumer="worker"):
+    jobs.complete(claim.event.id, Event(kind="result", source="worker", content="done"))
+```
+
+`key=` is a path (including a `Path` object), not a self-asserted agent name.
+The SDK signs `publish`, `request`, `claim`, `ack`, `wait`, `complete`, and the
+call handle's `result` and `release`. A claim-only key can complete requests
+whose live leases it holds. For `ack`, pass the original consumer name you
+used in `claim`, rather than the server's stamped `claim.consumer`.
+
+Replies are signed by the worker's sub-key. The caller's daemon checks the
+signature and current authority before returning `Event.signer` and
+`Event.signature` (base64). Ordinary published events have a daemon-stamped
+`source`, not a verified `signer` field. A source label by itself is not an
+identity credential.
+
+Use an explicit `Event.id` when retrying a send from a durable outbox. If it
+is empty the SDK generates an ID for that invocation, without changing the
+input event. Save request IDs and use `call_handle(id).result()` followed by
+`release()` after your own durable commit to recover across restarts.
+Signed sends are refused when no host can be reached; the daemon never
+retries them under its broader device authority.
+
+A credentialed client refuses queue hosting, resource listing and Vault
+access: those endpoints have no scoped-key binding here. It never silently
+falls back to the operator. A separate `Fabric()` client deliberately acts
+as the local operator.
+
+The daemon enforces scope, expiry and revocation; the SDK does not implement
+a second grant verifier. Socket access remains one Unix-user trust domain.
+The deployment must isolate a worker from operator sockets and other keys
+when it needs an adversarial boundary.
+
+Use the November 16 request/reply build or newer on both ends for scoped
+calls and signed `reply_target`. This is the local-daemon client; directly
+dialing a grantee key's `gates` without a daemon is not implemented.
+
+## Validation
+
+```bash
+python3 -m pytest -q
+python3 tests/run_daemon_tests.py /path/to/fabric
+```
+
+The second command overlays one test into the Fabric source checkout and
+runs two disposable nodes over loopback. It verifies the Python signatures
+against the Go daemon, both local and remote authorization, reply ownership,
+tampering, expiry and revocation. It needs Go, the Fabric source checkout
+and the `auth` extra; it leaves the source and live fleet unchanged.
 
 The fortune example installs as `fabric-fortune-worker` and `fabric-fortune`.
 

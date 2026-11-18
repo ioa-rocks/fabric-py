@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
+
+from .auth import Signer, append_value, field_digest
 from .transport import FabricError, json_request
 
 
@@ -17,6 +20,7 @@ class Event:
     correlation_id: str = ""
     at: int = 0
     signer: str = ""
+    signature: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v not in ("", 0)}
@@ -61,9 +65,9 @@ class Call:
         remaining = max(timeout, 0)
         while True:
             step = min(remaining, _MAX_PARK)
-            value = json_request(self.queue.socket_path, "POST", "/v0/outcome", {
-                "name": self.queue.name, "event_id": self.id, "timeout_s": step,
-            }, timeout=step + 10)
+            value = self.queue._post("outcome", {
+                "event_id": self.id, "timeout_s": step,
+            }, event_id=self.id, timeout=step + 10)
             outcome = (value or {}).get("outcome")
             if outcome is not None:
                 return Event.from_dict(outcome)
@@ -77,9 +81,7 @@ class Call:
         The host forgets the call and it stops counting against your quota
         of requests in flight. Releasing twice is harmless.
         """
-        json_request(self.queue.socket_path, "POST", "/v0/release", {
-            "name": self.queue.name, "event_id": self.id,
-        })
+        self.queue._post("release", {"event_id": self.id}, event_id=self.id)
 
 
 # The daemon parks one outcome request for at most ten minutes.
@@ -87,9 +89,20 @@ _MAX_PARK = 600
 
 
 class Queue:
-    def __init__(self, socket_path: Path, name: str) -> None:
+    def __init__(self, socket_path: Path, name: str, *, signer: Signer | None = None) -> None:
         self.socket_path = socket_path
         self.name = name if name.startswith("subject:") else f"subject:queues/{name}"
+        self._signer = signer
+
+    def _post(self, op: str, body: dict, *, event_id: str = "",
+              consumer: str = "", value: str = "", timeout: float | None = None) -> Any:
+        body = {"name": self.name, **body}
+        if self._signer is not None:
+            body["circle"] = self._signer.circle
+            body["principal"] = self._signer.sign(op, self.name, event_id, consumer, value)
+        if timeout is None:
+            return json_request(self.socket_path, "POST", "/v0/" + op, body)
+        return json_request(self.socket_path, "POST", "/v0/" + op, body, timeout=timeout)
 
     def host(self, *, delivery: str = "exclusive", accepts: list[str] | None = None,
              idle_s: int = 0, max_events: int = 0, spread: bool | None = None) -> Queue:
@@ -106,6 +119,8 @@ class Queue:
         publish to an expired queue raises with "expired": its owner is
         gone; do not retry.
         """
+        if self._signer is not None:
+            raise FabricError("queue hosting with a scoped key is not supported")
         body: dict[str, object] = {
             "name": self.name, "delivery": delivery, "accepts": accepts or [],
         }
@@ -119,10 +134,17 @@ class Queue:
         return self
 
     def publish(self, event: Event) -> tuple[str, bool]:
-        value = json_request(self.socket_path, "POST", "/v0/append", {
-            "name": self.name, "event": event.to_dict(),
-        })
+        value = self._append(event, reply=False)
         return value["id"], value["fresh"]
+
+    def _append(self, event: Event, *, reply: bool) -> dict:
+        if self._signer is not None and not event.id:
+            event = replace(event, id=uuid4().hex)
+        body: dict[str, Any] = {"event": event.to_dict()}
+        if reply:
+            body["reply"] = True
+        value = append_value(event, reply) if self._signer is not None else ""
+        return self._post("append", body, event_id=event.id, value=value)
 
     def request(self, event: Event) -> Call:
         """Publish a request whose reply you will wait for.
@@ -131,9 +153,7 @@ class Queue:
         reply with it, readable only by you. Unlike ``publish``, a request
         is never parked when no host is reachable; it fails at once.
         """
-        value = json_request(self.socket_path, "POST", "/v0/append", {
-            "name": self.name, "event": event.to_dict(), "reply": True,
-        })
+        value = self._append(event, reply=True)
         return Call(self, value["id"])
 
     def call_handle(self, request_id: str) -> Call:
@@ -163,33 +183,35 @@ class Queue:
         return reply
 
     def claim(self, *, consumer: str, lease: int = 30, limit: int = 1) -> list[Claim]:
-        values = json_request(self.socket_path, "POST", "/v0/claim", {
-            "name": self.name, "consumer": consumer, "lease_s": lease, "n": limit,
-        })
+        values = self._post("claim", {"consumer": consumer, "lease_s": lease, "n": limit},
+                            consumer=consumer)
         return [Claim(Event.from_dict(v["event"]), v["consumer"], v["lease_until"],
                       bool(v.get("awaited"))) for v in values]
 
     def complete(self, request_id: str, reply: Event) -> bool:
         """Finish a request you claimed: record its reply and ack it, in one step.
 
-        This is how a worker finishes any request. The daemon signs the
-        reply with this device's key. Returns False when nobody is waiting
+        This is how a worker finishes any request. A credentialed client
+        signs with its sub-key; otherwise the daemon signs with the device
+        key. Returns False when nobody is waiting
         for the reply (none was wanted, or the caller gave up); the request
         is acknowledged either way. Raises FabricError if your lease has
         lapsed: another worker may hold the request by now.
         """
-        value = json_request(self.socket_path, "POST", "/v0/complete", {
-            "name": self.name, "event_id": request_id, "event": reply.to_dict(),
-        })
+        digest = ""
+        if self._signer is not None:
+            reply = replace(reply, correlation_id=request_id, signer=self._signer.did,
+                            signature=self._signer.reply_signature(self.name, request_id, reply))
+            digest = field_digest("astral-complete-v1", reply.kind,
+                                  reply.content, reply.payload_ref).hex()
+        value = self._post("complete", {"event_id": request_id, "event": reply.to_dict()},
+                           event_id=request_id, value=digest)
         return bool(value["delivered"])
 
     def ack(self, event_id: str, *, consumer: str) -> None:
-        json_request(self.socket_path, "POST", "/v0/ack", {
-            "name": self.name, "consumer": consumer, "event_id": event_id,
-        })
+        self._post("ack", {"consumer": consumer, "event_id": event_id},
+                   event_id=event_id, consumer=consumer)
 
     def wait(self, *, timeout: int = 30) -> str:
-        value = json_request(self.socket_path, "POST", "/v0/wait", {
-            "name": self.name, "timeout_s": timeout,
-        }, timeout=timeout + 5)
+        value = self._post("wait", {"timeout_s": timeout}, timeout=timeout + 5)
         return value["woke"]

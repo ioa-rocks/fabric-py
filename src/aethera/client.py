@@ -4,9 +4,10 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 
+from .auth import Signer
 from .bucket import Bucket
 from .queue import Queue
-from .transport import json_request
+from .transport import FabricError, json_request
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,21 +40,24 @@ def default_state(name: str) -> Path:
 class Fabric:
     """Entry point for resources available through the local Fabric daemon."""
 
-    def __init__(self, *, key: str | None = None,
+    def __init__(self, *, key: str | os.PathLike[str] | None = None,
                  queue_state: str | os.PathLike[str] | None = None,
                  bucket_state: str | os.PathLike[str] | None = None) -> None:
-        if key is not None:
-            raise NotImplementedError("client-key authentication is designed but not implemented")
+        self._signer = Signer.load(Path(key)) if key is not None else None
         self.queue_socket = Path(queue_state or default_state("astral")) / "control.sock"
         self.bucket_socket = Path(bucket_state or default_state("vault")) / "control.sock"
 
     def queue(self, name: str) -> Queue:
-        return Queue(self.queue_socket, name)
+        return Queue(self.queue_socket, name, signer=self._signer)
 
     def bucket(self, name: str) -> Bucket:
+        if self._signer is not None:
+            raise FabricError("Vault access with a scoped key is not supported")
         return Bucket(self.bucket_socket, name)
 
     def resources(self, *, kind: str | None = None) -> list[Resource]:
+        if self._signer is not None:
+            raise FabricError("resource listing with a scoped key is not supported")
         out: list[Resource] = []
         if kind in (None, "bucket"):
             for value in json_request(self.bucket_socket, "GET", "/v0/buckets"):
